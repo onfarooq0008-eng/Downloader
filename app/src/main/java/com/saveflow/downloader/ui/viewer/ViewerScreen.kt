@@ -58,7 +58,6 @@ fun ViewerScreen(
             CustomTopBar(
                 title = r?.fileName ?: "",
                 onBack = onBack,
-                modifier = Modifier.padding(0.dp),
                 actions = {
                     if (r != null) {
                         IconButton(onClick = { FileActions.open(context, r.savedUri, r.mimeType) }) {

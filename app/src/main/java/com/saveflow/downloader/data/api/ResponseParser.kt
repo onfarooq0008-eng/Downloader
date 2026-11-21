@@ -14,7 +14,7 @@ import retrofit2.Response
 
 /**
  * Turns the backend response into [MediaInfo].
- *  1. Raw media (video/*, image/*, octet-stream): the API URL itself is the download URL.
+ *  1. Raw media (a video, image or octet-stream content type): the API URL itself is the download URL.
  *  2. JSON: items are located via the key lists in [ApiConfig].
  */
 class ResponseParser {

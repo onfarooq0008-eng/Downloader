@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -56,16 +58,30 @@ import com.saveflow.downloader.domain.models.Platform
 import com.saveflow.downloader.utils.ClipboardUtils
 import com.saveflow.downloader.utils.FileActions
 import com.saveflow.downloader.utils.UrlUtils
+import kotlinx.coroutines.delay
+import org.json.JSONObject
+import org.json.JSONTokener
 
 /**
  * Owns the WebView for the lifetime of the activity so page, history and scroll position
  * survive switching bottom-navigation tabs.
+ *
+ * Video detection combines three signals: <video> elements on the page (found by a small script),
+ * direct video file requests seen by the WebView, and known social-media post URLs.
  */
 class BrowserState(context: Context) {
     var url by mutableStateOf("")
     var progress by mutableFloatStateOf(0f)
     var canGoBack by mutableStateOf(false)
     var canGoForward by mutableStateOf(false)
+
+    /** A direct video file URL on the current page, if one was found. */
+    var directUrl by mutableStateOf<String?>(null)
+    /** True when the current page contains a <video> element. */
+    var pageHasVideo by mutableStateOf(false)
+
+    val videoDetected: Boolean
+        get() = directUrl != null || pageHasVideo || UrlUtils.isMediaLink(url)
 
     @SuppressLint("SetJavaScriptEnabled")
     val webView: WebView = WebView(context).apply {
@@ -77,9 +93,21 @@ class BrowserState(context: Context) {
         settings.displayZoomControls = false
         webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView, pageUrl: String?, favicon: Bitmap?) = sync(view, pageUrl)
-            override fun onPageFinished(view: WebView, pageUrl: String?) = sync(view, pageUrl)
-            // Fires for single-page-app navigations (Instagram, X) that never reload the page.
+            override fun onPageFinished(view: WebView, pageUrl: String?) {
+                sync(view, pageUrl)
+                detectVideo()
+            }
+            // Fires for single-page-app navigations (Instagram, X, TikTok) that never reload the page.
             override fun doUpdateVisitedHistory(view: WebView, pageUrl: String?, isReload: Boolean) = sync(view, pageUrl)
+
+            // Runs on a background thread: only look at the URL, then hop to the main thread.
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val requested = request.url.toString()
+                if (UrlUtils.isVideoFileUrl(requested)) {
+                    view.post { if (this@BrowserState.directUrl == null) this@BrowserState.directUrl = requested }
+                }
+                return null
+            }
         }
         webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, newProgress: Int) {
@@ -91,9 +119,30 @@ class BrowserState(context: Context) {
     }
 
     private fun sync(view: WebView, pageUrl: String?) {
-        pageUrl?.let { url = it }
+        if (pageUrl != null && pageUrl != url) {
+            // New page: forget what was detected on the previous one.
+            directUrl = if (UrlUtils.isVideoFileUrl(pageUrl)) pageUrl else null
+            pageHasVideo = false
+            url = pageUrl
+        }
         canGoBack = view.canGoBack()
         canGoForward = view.canGoForward()
+    }
+
+    /** Looks for <video> elements. Must be called on the main thread. */
+    fun detectVideo() {
+        webView.evaluateJavascript(DETECT_JS) { raw ->
+            runCatching {
+                val json = JSONTokener(raw).nextValue() as? String ?: return@runCatching
+                val result = JSONObject(json)
+                pageHasVideo = result.optInt("n") > 0
+                val sources = result.optJSONArray("u")
+                if (sources != null && sources.length() > 0) {
+                    // The element's own source is what is actually playing, so it wins over earlier guesses.
+                    directUrl = sources.optString(0).takeIf { it.isNotBlank() } ?: directUrl
+                }
+            }
+        }
     }
 
     fun load(input: String) = webView.loadUrl(UrlUtils.normalizeInput(input))
@@ -105,6 +154,22 @@ class BrowserState(context: Context) {
 
     companion object {
         const val HOME = "https://www.google.com"
+
+        // Returns {"n": number of <video> elements, "u": [http(s) sources]}; blob: sources are skipped.
+        private const val DETECT_JS = """
+            (function() {
+              var vids = document.querySelectorAll('video');
+              var urls = [];
+              vids.forEach(function(v) {
+                var s = v.currentSrc || v.src;
+                if (s && /^https?:/.test(s)) urls.push(s);
+                v.querySelectorAll('source').forEach(function(x) {
+                  if (x.src && /^https?:/.test(x.src)) urls.push(x.src);
+                });
+              });
+              return JSON.stringify({n: vids.length, u: urls});
+            })()
+        """
     }
 }
 
@@ -112,7 +177,7 @@ class BrowserState(context: Context) {
 fun BrowserScreen(
     state: BrowserState,
     isActive: Boolean,
-    onSendToDownloader: (String) -> Unit,
+    onDownload: (pageUrl: String, directUrl: String?) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -122,7 +187,13 @@ fun BrowserScreen(
 
     BackHandler(enabled = isActive && state.canGoBack) { state.webView.goBack() }
 
-    val detected = state.url.takeIf { UrlUtils.isMediaLink(it) }
+    // Videos often appear after the page loads (lazy loading, scrolling), so re-check while this tab is visible.
+    LaunchedEffect(isActive) {
+        while (isActive) {
+            state.detectVideo()
+            delay(2_500)
+        }
+    }
 
     Column(modifier.fillMaxSize()) {
         Column(Modifier.statusBarsPadding().padding(horizontal = 12.dp, vertical = 8.dp)) {
@@ -163,26 +234,29 @@ fun BrowserScreen(
             }
         }
 
-        AnimatedVisibility(visible = detected != null) {
-            detected?.let { url ->
-                Surface(
-                    modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 8.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer,
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
-                ) {
-                    Row(Modifier.padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        PlatformIcon(Platform.detect(url), size = 32.dp)
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text("Media link detected", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                            Text(UrlUtils.displayHost(url), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f))
-                        }
-                        Button(onClick = { onSendToDownloader(url) }, shape = RoundedCornerShape(12.dp)) {
-                            Icon(Icons.Rounded.Download, null)
-                            Spacer(Modifier.width(6.dp))
-                            Text("Download")
-                        }
+        AnimatedVisibility(visible = state.videoDetected && state.url.isNotBlank()) {
+            Surface(
+                modifier = Modifier.padding(horizontal = 12.dp).padding(bottom = 8.dp),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
+            ) {
+                Row(Modifier.padding(start = 12.dp, top = 8.dp, bottom = 8.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    PlatformIcon(Platform.detect(state.url), size = 32.dp)
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Video detected", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onPrimaryContainer)
+                        Text(
+                            UrlUtils.displayHost(state.url),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.75f),
+                            maxLines = 1
+                        )
+                    }
+                    Button(onClick = { onDownload(state.url, state.directUrl) }, shape = RoundedCornerShape(12.dp)) {
+                        Icon(Icons.Rounded.Download, null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Download")
                     }
                 }
             }

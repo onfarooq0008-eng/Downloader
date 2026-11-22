@@ -21,10 +21,10 @@ class MainActivity : ComponentActivity() {
         handleIntent(intent)
     }
 
-    /** A link shared from another app is handed to the home screen; it is never fetched automatically. */
+    /** A link shared from another app (Instagram, TikTok, ...) starts downloading right away. */
     private fun handleIntent(intent: Intent?) {
         if (intent?.action != Intent.ACTION_SEND) return
         val url = UrlUtils.extractUrl(intent.getStringExtra(Intent.EXTRA_TEXT)) ?: return
-        (application as SaveFlowApp).container.session.incomingLink.value = IncomingLink(url, autoStart = false)
+        (application as SaveFlowApp).container.session.incomingLink.value = IncomingLink(url)
     }
 }

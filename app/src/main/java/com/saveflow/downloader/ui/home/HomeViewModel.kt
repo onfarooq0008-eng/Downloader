@@ -5,9 +5,11 @@ import androidx.lifecycle.viewModelScope
 import com.saveflow.downloader.AppContainer
 import com.saveflow.downloader.data.api.ApiException
 import com.saveflow.downloader.domain.models.DownloadRecord
+import com.saveflow.downloader.domain.models.MediaInfo
 import com.saveflow.downloader.domain.models.Platform
 import com.saveflow.downloader.utils.UrlUtils
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -29,8 +31,10 @@ data class HomeState(
 )
 
 sealed interface HomeEvent {
-    data object OpenPreview : HomeEvent
-    data object ShowHome : HomeEvent
+    /** The link was resolved; the UI asks for permissions, then calls [HomeViewModel.enqueue]. */
+    data class StartDownload(val info: MediaInfo) : HomeEvent
+    data class Started(val count: Int) : HomeEvent
+    data class Message(val text: String) : HomeEvent
 }
 
 class HomeViewModel(private val c: AppContainer) : ViewModel() {
@@ -40,18 +44,27 @@ class HomeViewModel(private val c: AppContainer) : ViewModel() {
     private val _events = Channel<HomeEvent>(Channel.BUFFERED)
     val events = _events.receiveAsFlow()
 
-    val recent: StateFlow<List<DownloadRecord>> = c.downloadRepository.completed
+    private val repo = c.downloadRepository
+    private val lazily = SharingStarted.WhileSubscribed(5_000)
+
+    val recent: StateFlow<List<DownloadRecord>> = repo.completed
         .map { it.take(6) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+        .stateIn(viewModelScope, lazily, emptyList())
+    val active: StateFlow<List<DownloadRecord>> = repo.active.stateIn(viewModelScope, lazily, emptyList())
+    val speeds: StateFlow<Map<Long, Long>> = repo.speeds
+
+    private var job: Job? = null
 
     init {
-        // Links arriving from the share sheet or the browser tab.
+        // Links from the share sheet or the browser's download button start immediately.
         viewModelScope.launch {
             c.session.incomingLink.filterNotNull().collect { link ->
                 c.session.incomingLink.value = null
-                _state.update { it.copy(input = link.url, error = null, clipSuggestion = null) }
-                _events.send(HomeEvent.ShowHome)
-                if (link.autoStart) analyze()
+                if (_state.value.loading) {
+                    _events.send(HomeEvent.Message("Please wait — another link is still being processed."))
+                } else {
+                    start(link.url, link.fallbackUrl, manual = false)
+                }
             }
         }
     }
@@ -91,23 +104,47 @@ class HomeViewModel(private val c: AppContainer) : ViewModel() {
 
     fun dismissSuggestion() = _state.update { it.copy(clipSuggestion = null) }
 
-    fun analyze() {
-        val current = _state.value
-        if (current.loading) return
-        viewModelScope.launch {
+    /** The Download button: resolves the typed link and downloads it. */
+    fun analyze() = start(_state.value.input, fallbackUrl = null, manual = true)
+
+    fun cancel() {
+        job?.cancel()
+        _state.update { it.copy(loading = false) }
+    }
+
+    private fun start(rawInput: String, fallbackUrl: String?, manual: Boolean) {
+        if (_state.value.loading) return
+        job = viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             try {
-                val info = c.fetchMedia(current.input)
-                c.session.media.value = info
-                _state.update { it.copy(loading = false) }
-                _events.send(HomeEvent.OpenPreview)
+                val info = try {
+                    c.fetchMedia(rawInput)
+                } catch (e: ApiException) {
+                    // The API couldn't handle the page; use the direct video file the browser found, if any.
+                    if (fallbackUrl != null) c.fetchMedia.directMedia(fallbackUrl, rawInput) else throw e
+                }
+                _state.update { it.copy(loading = false, input = if (manual) "" else it.input) }
+                _events.send(HomeEvent.StartDownload(info))
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: ApiException) {
-                _state.update { it.copy(loading = false, error = e.message) }
             } catch (e: Exception) {
-                _state.update { it.copy(loading = false, error = "Unexpected error. Please try again.") }
+                val message = (e as? ApiException)?.message ?: "Unexpected error. Please try again."
+                _state.update { it.copy(loading = false, error = if (manual) message else null) }
+                if (!manual) _events.send(HomeEvent.Message(message))
             }
         }
     }
+
+    /** Queues every item of a resolved link (a carousel downloads all its media). */
+    fun enqueue(info: MediaInfo) {
+        viewModelScope.launch {
+            val n = repo.enqueue(info, info.items)
+            _events.send(HomeEvent.Started(n))
+        }
+    }
+
+    fun pause(id: Long) = repo.pause(id)
+    fun resume(id: Long) = repo.resume(id)
+    fun retry(id: Long) = repo.retry(id)
+    fun cancelDownload(id: Long) = repo.cancel(id)
 }

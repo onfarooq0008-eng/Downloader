@@ -28,6 +28,15 @@ object UrlUtils {
         return segments.size >= 2 || (segments.size == 1 && isShort)
     }
 
+    private val videoExtensions = setOf("mp4", "webm", "mov", "m4v", "mkv", "3gp")
+
+    /** True for an http(s) URL whose path ends in a common video file extension. */
+    fun isVideoFileUrl(url: String): Boolean {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return false
+        val path = runCatching { Uri.parse(url).path }.getOrNull()?.lowercase() ?: return false
+        return path.substringAfterLast('.', "") in videoExtensions
+    }
+
     /** Turns address-bar input into a loadable URL (adds https:// or falls back to a web search). */
     fun normalizeInput(input: String): String {
         val t = input.trim()

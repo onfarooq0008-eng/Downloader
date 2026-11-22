@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.SystemClock
+import android.webkit.WebSettings
+import com.saveflow.downloader.data.api.ApiConfig
 import androidx.core.content.ContextCompat
 import com.saveflow.downloader.data.database.DownloadDao
 import com.saveflow.downloader.data.database.DownloadEntity
@@ -143,6 +145,11 @@ class DownloadEngine(
 
         val request = Request.Builder().url(entity.downloadUrl).apply {
             if (offset > 0) header("Range", "bytes=$offset-")
+            // Direct file URLs found in the browser often reject requests without a page referer / browser UA.
+            if (!entity.downloadUrl.startsWith(ApiConfig.BASE_URL)) {
+                header("Referer", entity.sourceUrl)
+                header("User-Agent", WebSettings.getDefaultUserAgent(context))
+            }
         }.build()
         val call = client.newCall(request)
         val cancelHandle = currentCoroutineContext()[Job]!!.invokeOnCompletion { call.cancel() }

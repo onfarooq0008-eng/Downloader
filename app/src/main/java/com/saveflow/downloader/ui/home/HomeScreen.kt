@@ -47,7 +47,7 @@ import com.saveflow.downloader.domain.models.Platform
 import com.saveflow.downloader.ui.components.DownloadButton
 import com.saveflow.downloader.ui.components.DownloadHistoryItem
 import com.saveflow.downloader.ui.components.EmptyStateView
-import com.saveflow.downloader.ui.components.LoadingAnimation
+import com.saveflow.downloader.ui.components.DownloadProgressCard
 import com.saveflow.downloader.ui.components.PlatformIcon
 import com.saveflow.downloader.ui.components.URLInputField
 import com.saveflow.downloader.utils.ClipboardUtils
@@ -64,6 +64,8 @@ fun HomeScreen(
     val context = LocalContext.current
     val state by vm.state.collectAsStateWithLifecycle()
     val recent by vm.recent.collectAsStateWithLifecycle()
+    val active by vm.active.collectAsStateWithLifecycle()
+    val speeds by vm.speeds.collectAsStateWithLifecycle()
 
     // Android 10+ only lets the focused app read the clipboard, so wait for window focus.
     val focused = LocalWindowInfo.current.isWindowFocused
@@ -109,9 +111,6 @@ fun HomeScreen(
                         loading = state.loading,
                         enabled = state.input.isNotBlank()
                     )
-                    AnimatedVisibility(visible = state.loading) {
-                        LoadingAnimation(label = "Contacting server… this can take a few seconds")
-                    }
                 }
             }
         }
@@ -145,6 +144,29 @@ fun HomeScreen(
         }
 
         item { SupportedPlatforms(ApiConfig.enabledPlatforms) }
+
+        if (active.isNotEmpty()) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Downloading", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    if (active.size > 3) TextButton(onClick = onSeeAll) { Text("See all (${active.size})") }
+                }
+            }
+            items(active.take(3), key = { "active-${it.id}" }) { record ->
+                DownloadProgressCard(
+                    record = record,
+                    speedBytesPerSecond = speeds[record.id] ?: 0L,
+                    onPause = { vm.pause(record.id) },
+                    onResume = { vm.resume(record.id) },
+                    onCancel = { vm.cancelDownload(record.id) },
+                    onRetry = { vm.retry(record.id) },
+                    modifier = Modifier.padding(bottom = 10.dp)
+                )
+            }
+        }
 
         item {
             Row(
